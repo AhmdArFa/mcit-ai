@@ -1,0 +1,103 @@
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:v2
+    # Credentials default to root:root for a zero-config local setup. Before
+    # exposing this instance to a network, set SURREAL_USER / SURREAL_PASSWORD
+    # in a .env file (see .env.example) — they are applied here and to the
+    # open_notebook service below, so the two always stay in sync.
+    # List (exec) form so each interpolated value stays a single argument —
+    # a password containing spaces would otherwise be split into several.
+    command: ["start", "--log", "info", "--user", "${SURREAL_USER:-root}", "--pass", "${SURREAL_PASSWORD:-root}", "rocksdb:/mydata/mydatabase.db"]
+    user: root  # Required for bind mounts on Linux
+    ports:
+      # Bound to localhost only: the open_notebook service reaches this over
+      # the internal compose network regardless, so the host port is purely
+      # for local debugging (e.g. Surrealist, `surreal sql`). Exposing this
+      # on 0.0.0.0 would let anyone who can reach the host connect with the
+      # default root:root credentials.
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./surreal_data:/mydata
+    environment:
+      - SURREAL_EXPERIMENTAL_GRAPHQL=true
+    restart: always
+    pull_policy: always
+
+  # Local LLM runtime (MCIT LM is local-only: no cloud API keys needed)
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ./ollama_data:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    restart: always
+
+  # One-shot: pulls the default models into the ollama volume (cached after first run)
+  ollama-pull:
+    image: ollama/ollama:latest
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    entrypoint: ["sh", "-c", "sleep 3 && ollama pull ${OLLAMA_CHAT_MODEL:-qwen2.5:7b} && ollama pull ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}"]
+    depends_on:
+      - ollama
+    restart: "no"
+
+  # Self-hosted text-to-speech (OpenAI-compatible) so podcasts stay fully local
+  kokoro:
+    image: ghcr.io/remsky/kokoro-fastapi-cpu:latest
+    ports:
+      - "127.0.0.1:8880:8880"
+    restart: always
+
+  open_notebook:
+    build: .
+    image: mcit-lm:local
+    ports:
+      - "8502:8502"  # Web UI
+      - "5055:5055"  # REST API
+    environment:
+      # REQUIRED: Change this to your own secret string
+      # This encrypts your API keys in the database
+      - OPEN_NOTEBOOK_ENCRYPTION_KEY=${OPEN_NOTEBOOK_ENCRYPTION_KEY:-change-me-to-a-secret-string}
+
+      # Local LLM (Ollama) — the only AI provider MCIT LM needs
+      - OLLAMA_API_BASE=http://ollama:11434
+      - OLLAMA_CHAT_MODEL=${OLLAMA_CHAT_MODEL:-qwen2.5:7b}
+      - OLLAMA_EMBEDDING_MODEL=${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
+      - OPEN_NOTEBOOK_WORKER_MAX_TASKS=${OPEN_NOTEBOOK_WORKER_MAX_TASKS:-1}
+
+      # Local text-to-speech for podcasts (Kokoro, OpenAI-compatible API)
+      - OPENAI_COMPATIBLE_BASE_URL_TTS=http://kokoro:8880/v1
+      - LOCAL_TTS_MODEL=kokoro
+
+      # Browser calls /api on the UI origin; Next.js proxies to the API
+      - API_URL=same-origin
+
+      # Database connection. SURREAL_USER / SURREAL_PASSWORD default to root:root
+      # for local use; override them in a .env file before exposing the instance
+      # (the same values configure the surrealdb service above).
+      - SURREAL_URL=ws://surrealdb:8000/rpc
+      - SURREAL_USER=${SURREAL_USER:-root}
+      - SURREAL_PASSWORD=${SURREAL_PASSWORD:-root}
+      - SURREAL_NAMESPACE=open_notebook
+      - SURREAL_DATABASE=open_notebook
+
+      # OPTIONAL: heavy extraction runtimes, installed on first startup when
+      # enabled (downloads are cached on the ./notebook_data volume, so only the
+      # first boot is slow). See docs/5-CONFIGURATION/environment-reference.md.
+      # - OPEN_NOTEBOOK_ENABLE_DOCLING=true    # Docling engine + OCR + image sources (large ML stack)
+      # - OPEN_NOTEBOOK_ENABLE_CRAWL4AI=true   # local Crawl4AI (bundles a Chromium browser)
+      # - CRAWL4AI_API_URL=http://crawl4ai:11235  # use a remote Crawl4AI server instead (no local install)
+      # - CRAWL4AI_API_TOKEN=${CRAWL4AI_API_TOKEN}  # bearer token for that server (required by Crawl4AI >= 0.9.0)
+
+      # OPTIONAL: max concurrent background tasks the worker processes at once
+      # (default 5). Set to 1 for sequential processing on single-GPU / local
+      # LLM setups to avoid overloading the model with parallel requests.
+      # - OPEN_NOTEBOOK_WORKER_MAX_TASKS=1
+    volumes:
+      - ./notebook_data:/app/data
+    depends_on:
+      - surrealdb
+      - ollama
+      - kokoro
+    restart: always
